@@ -16,3 +16,12 @@ tprs_all_datasets = plot_and_return_tprs(tprs, plot=False)
 fpr_losses, tpr_losses = calc_and_plot_losses(background_losses_all, signal_losses_all, signal_labels, num_thresholds=1000, plot=False)
 
 losses, labels = plot_histogram(background_losses_all, signal_losses_all, signal_labels, bin_size=100, plot=False)
+
+experiment_number = 1
+variables_to_save = ["train_losses", "val_losses", "zeros", "total", "tprs",
+                     "background_losses_all", "signal_losses_all", "sparsity",
+                     "train_losses_last", "val_losses_last", "tprs_all_datasets",
+                     "fpr_losses", "tpr_losses", "losses"]
+
+for var in variables_to_save:
+    np.save(f'{var}_{experiment_number}.npy', locals()[var])
