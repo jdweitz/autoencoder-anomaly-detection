@@ -1,5 +1,7 @@
 import numpy as np
 import h5py
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 import torch
 import torch.optim as optim
 import torch.nn as nn
@@ -10,44 +12,72 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 import torch.nn.utils.prune as prune
 import copy
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
+# Load data
 class SignalDataset(Dataset):
-    def __init__(self, signal_files, signal_labels): #signals is a list of all the signal datasets you want to include
+    def __init__(self, signal_files, signal_labels): # signals is a list of all the signal datasets you want to include
         signal_data = []
+        signal_scaled_data = []  # new list for scaled data
         for i, label in enumerate(signal_labels):
             with h5py.File(signal_files[i], 'r') as file:
-                test_data = np.array(file['Data'])
+                test_data = np.array(file['data'])
+                test_scaled_data = np.array(file['scaled_data'])  # reading the scaled data
+                
             signal_data.append(test_data)
+            signal_scaled_data.append(test_scaled_data)  # appending the scaled data
 
         self.data = np.squeeze(np.array(signal_data)) # save signal data as np array
-
+        self.scaled_data = np.squeeze(np.array(signal_scaled_data))  # save scaled signal data as np array
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, index):
-        return torch.from_numpy(self.data[index])
+        data_sample = torch.from_numpy(self.data[index]).type(torch.float32)
+        scaled_data_sample = torch.from_numpy(self.scaled_data[index]).type(torch.float32)  # get scaled data
+        return data_sample, scaled_data_sample  # return both the original data and its scaled version
 
 class BkgDataset(Dataset):
-    def __init__(self, bkg_file, split): #split = 'X_train', or 'X_test', etc.
+    def __init__(self, bkg_file, split):
         with h5py.File(bkg_file, 'r') as file:
-          self.data = torch.tensor(file[split][:])
+            data = np.array(file['data'])
+            data_target = np.array(file['data_target'])
+
+            total_length = len(data)
+            train_boundary = int(0.4 * total_length)
+            val_boundary = int(0.5 * total_length)
+
+            # Adjusting for the 40-10-50 split:
+            if split == 'train':
+                self.data = data[:train_boundary]
+                self.data_target = data_target[:train_boundary]
+            elif split == 'val':
+                self.data = data[train_boundary:val_boundary]
+                self.data_target = data_target[train_boundary:val_boundary]
+            else:  # 'test'
+                self.data = data[val_boundary:]
+                self.data_target = data_target[val_boundary:]
+
+            self.data = torch.tensor(self.data, dtype=torch.float32)
+            self.data_target = torch.tensor(self.data_target, dtype=torch.float32)
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, index):
-        return self.data[index]
+        # Return both data and data_target
+        return self.data[index], self.data_target[index]
 
-def get_data_loaders(path, BATCH_SIZE = 1024):
-    bkg_file = path + 'BKG_dataset.h5'
-    signal_1 = path + 'Ato4l_lepFilter_13TeV_dataset.h5'
-    signal_2 = path + 'hChToTauNu_13TeV_PU20_dataset.h5'
-    signal_3 = path + 'hToTauTau_13TeV_PU20_dataset.h5'
-    signal_4 = path + 'leptoquark_LOWMASS_lepFilter_13TeV_dataset.h5'
+def get_dataloaders(path, BATCH_SIZE = 1024):
+    bkg_file = path + "all_background_processed.h5"
+    signal_1 = path + 'all_leptoquark_processed.h5'
+    signal_2 = path + 'all_Ato4l_processed.h5'
+    signal_3 = path + 'all_hChToTauNu_processed.h5'
+    signal_4 = path + 'all_hToTauTau_processed.h5'
 
     # add correct signal labels
-    signal_labels = ['Ato4l','hChToTauNu', 'hToTauTau', 'leptoquark']
+    signal_labels = ['leptoquark','Ato4l','hChToTauNu', 'hToTauTau']
 
     # add correct path to signal files
     signal_files = [signal_1, signal_2, signal_3, signal_4]
@@ -58,40 +88,41 @@ def get_data_loaders(path, BATCH_SIZE = 1024):
       #init datasets
       dataset = SignalDataset([signal_files[i]],[signal_labels[i]])
       #make loader
-      dataloader = DataLoader(dataset, batch_size=1024, shuffle=True) # different than actual batch size
+      dataloader = DataLoader(dataset, batch_size= BATCH_SIZE, shuffle=True) # different than actual batch size
       #add loader to list
       list_of_signal_dataloaders.append(dataloader)
 
     # Initialize background data
-    bkg_train_loader = DataLoader( BkgDataset(bkg_file,'X_train'), batch_size=BATCH_SIZE, shuffle=True)
-    bkg_val_loader = DataLoader( BkgDataset(bkg_file,'X_val'), batch_size=BATCH_SIZE, shuffle=False)
-    bkg_test_loader = DataLoader( BkgDataset(bkg_file,'X_test'), batch_size=BATCH_SIZE, shuffle=False)
+    bkg_trainloader = DataLoader(BkgDataset(bkg_file,'train'), batch_size=BATCH_SIZE, shuffle=True)
+    bkg_valloader = DataLoader(BkgDataset(bkg_file,'val'), batch_size=BATCH_SIZE, shuffle=False)
+    bkg_testloader = DataLoader(BkgDataset(bkg_file,'test'), batch_size=BATCH_SIZE, shuffle=False)
 
-    return list_of_signal_dataloaders, bkg_train_loader, bkg_val_loader, bkg_test_loader, signal_labels
+    return list_of_signal_dataloaders, bkg_trainloader, bkg_valloader, bkg_testloader, signal_labels
 
+# Model, train, test
 class Autoencoder(nn.Module):
-    def __init__(self, input_size = 57):
+    def __init__(self, input_size = 57, latent_dim=3):
         super(Autoencoder, self).__init__()
         # Encoder
         self.encoder = nn.Sequential(
-            nn.Linear(input_size, 32),
-            nn.ReLU(),
+            nn.BatchNorm1d(input_size),
+            self._init_weights(nn.Linear(input_size, 32)),
             nn.BatchNorm1d(32),
-            nn.Linear(32, 16),
-            nn.ReLU(),
+            nn.LeakyReLU(0.3),
+            self._init_weights(nn.Linear(32, 16)),
             nn.BatchNorm1d(16),
-            nn.Linear(16, 3),
-            nn.ReLU()
+            nn.LeakyReLU(0.3),
+            self._init_weights(nn.Linear(16, latent_dim))
         )
         # Decoder
         self.decoder = nn.Sequential(
-            nn.Linear(3, 16),
-            nn.ReLU(),
+            self._init_weights(nn.Linear(latent_dim, 16)),
             nn.BatchNorm1d(16),
-            nn.Linear(16, 32),
-            nn.ReLU(),
+            nn.LeakyReLU(0.3),
+            self._init_weights(nn.Linear(16, 32)),
             nn.BatchNorm1d(32),
-            nn.Linear(32, 57)
+            nn.LeakyReLU(0.3),
+            self._init_weights(nn.Linear(32, input_size))
         )
 
     def forward(self, x):
@@ -99,24 +130,37 @@ class Autoencoder(nn.Module):
         x = self.decoder(x)
         return x
 
-def train(model, train_loader, num_epochs, lr = 0.001, early_stopping_patience=10, get_losses = False, val_loader = None):
+    def _init_weights(self, layer): # implemented this to mimic the HeUniform in tf model
+        nn.init.kaiming_uniform_(layer.weight, a=0, mode='fan_in', nonlinearity='leaky_relu')
+        if layer.bias is not None:
+            nn.init.zeros_(layer.bias)
+        return layer
+
+
+def train(model, train_loader, num_epochs, lr = 0.00001, early_stopping_patience=10, get_losses = False, val_loader = None): # changed lr to .00001 from .0001, as done in ref
     # Init training optimizers
     optimizer = optim.Adam(model.parameters(), lr = lr)
-    criterion = nn.MSELoss()
+    #scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=2, verbose=True, min_lr=1E-6)
+    #criterion = nn.MSELoss()
+    criterion = custom_MSE
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
     patience_counter = 0
 
+    device = next(model.parameters()).device # added for cuda
 
     # Training loop
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0
-        for data in train_loader:
+        for data, data_scaled in train_loader:
+            data = data.float().to(device)  # ensure data is on the same device as the model (added for cuda)
+            data_scaled = data_scaled.float().to(device) # target
             optimizer.zero_grad()
-            outputs = model(data.float())
-            loss = criterion(outputs, data.float())
+            outputs = model(data)
+            loss = criterion(outputs, data_scaled) # data_scaled is target
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -127,7 +171,8 @@ def train(model, train_loader, num_epochs, lr = 0.001, early_stopping_patience=1
             train_losses.append(train_loss / len(train_loader))
             val_losses.append(val_loss)
 
-            #print('epoch [{}/{}], Validation loss:{:.4f}'.format(epoch + 1, num_epochs, val_loss))
+            # Call the scheduler step with the current validation loss
+            scheduler.step(val_loss)
 
             # Check for early stopping
             if val_loss < best_val_loss:
@@ -146,12 +191,15 @@ def train(model, train_loader, num_epochs, lr = 0.001, early_stopping_patience=1
 def test(model, dataloader):
   # Testing the autoencoder
   model.eval()
-  criterion = nn.MSELoss()
+  #criterion = nn.MSELoss()
+  criterion = custom_MSE
   test_loss = 0
   with torch.no_grad():
-      for data in dataloader:
-          outputs = model(data.float())
-          loss = criterion(outputs, data.float())
+      for data, data_scaled in dataloader:
+          data = data.float().to(device)  # Move data to the device that the model is on
+          data_scaled = data_scaled.float().to(device)
+          outputs = model(data)
+          loss = criterion(outputs, data_scaled)
           test_loss += loss.item()
 
   test_loss = test_loss / len(dataloader)
@@ -159,43 +207,74 @@ def test(model, dataloader):
   print('Loss: {:.4f}'.format(test_loss))
   return test_loss
 
-def get_tpr(fpr, background_losses, signal_losses): #signal_losses is just the losses for one specifc signal dataset
-  background_losses.sort()
-  num_false_pos = int(len(background_losses) * fpr)
-  threshold = background_losses[-num_false_pos]
-  tpr = np.sum(signal_losses > threshold) / len(signal_losses)
-  return tpr
+# Loss, FPR, TPR
+def custom_MSE(inputs, outputs):
+    inputs = inputs.reshape((inputs.shape[0], 19, 3, 1))
+    outputs = outputs.reshape((outputs.shape[0], 19, 3, 1))
 
-def compute_losses(model, dataloader_test, list_of_signal_dataloaders):
-    def batch_MSE(outputs, targets):
-        loss = torch.mean((outputs - targets)**2, axis = 1)
-        return loss
+    # trick on phi
+    outputs_phi = torch.pi * torch.tanh(outputs)
+    # trick on eta
+    outputs_eta_egamma = 3.0 * torch.tanh(outputs)
+    outputs_eta_muons = 2.1 * torch.tanh(outputs)
+    outputs_eta_jets = 4.0 * torch.tanh(outputs)
+    outputs_eta = torch.cat([outputs[:,0:1,:], outputs_eta_egamma[:,1:5,:], outputs_eta_muons[:,5:9,:], outputs_eta_jets[:,9:19,:]], dim=1)
+    outputs = torch.cat([outputs[:,:,0], outputs_eta[:,:,1], outputs_phi[:,:,2]], dim=2)
 
-    #Get losses for different signal datasets
-    model.eval()
+    # change input shape
+    inputs = torch.squeeze(inputs, -1)
 
-    # Compute losses for the background dataset
-    background_losses = []
-    with torch.no_grad():
-        for data in dataloader_test:  # using the validation dataloader you defined
-            outputs = model(data.float())
-            loss = batch_MSE(outputs, data.float())
-            background_losses += list(loss)
+    # calculate and apply mask
+    mask = torch.ne(inputs, 0)
+    outputs = torch.mul(outputs, mask)
 
-    background_losses = np.array(background_losses)
+    vanilla_MSE = nn.MSELoss()
+    reco_loss = vanilla_MSE(inputs.reshape(inputs.shape[0], 57), outputs.reshape(outputs.shape[0], 57))
+    return reco_loss
 
-    # Compute losses for different signal datasets
-    signal_losses = []
-    for i in range(4):
-        losses = [] #[1,2,3,...] [[1,2,3,4],[5,6,7,8],...]
-        with torch.no_grad():
-            for data in list_of_signal_dataloaders[i]:
-                outputs = model(data.float())
-                loss = batch_MSE(outputs, data.float())
-                losses += list(loss)
-        signal_losses.append(np.array(losses))
+def batch_custom_MSE(inputs, outputs):
+    inputs = inputs.reshape((inputs.shape[0], 19, 3, 1))
+    outputs = outputs.reshape((outputs.shape[0], 19, 3, 1))
 
-    return background_losses, signal_losses
+    # trick on phi
+    outputs_phi = torch.pi * torch.tanh(outputs)
+    # trick on eta
+    outputs_eta_egamma = 3.0 * torch.tanh(outputs)
+    outputs_eta_muons = 2.1 * torch.tanh(outputs)
+    outputs_eta_jets = 4.0 * torch.tanh(outputs)
+    outputs_eta = torch.cat([outputs[:,0:1,:], outputs_eta_egamma[:,1:5,:], outputs_eta_muons[:,5:9,:], outputs_eta_jets[:,9:19,:]], dim=1)
+    outputs = torch.cat([outputs[:,:,0], outputs_eta[:,:,1], outputs_phi[:,:,2]], dim=2)
+
+    # change input shape
+    inputs = torch.squeeze(inputs, -1)
+
+    # calculate and apply mask
+    mask = torch.ne(inputs, 0)
+    outputs = torch.mul(outputs, mask)
+
+    # Reshape inputs and outputs
+    inputs = inputs.reshape(inputs.shape[0], 57)
+    outputs = outputs.reshape(outputs.shape[0], 57)
+
+    # Calculate MSE per instance in batch
+    losses = torch.mean((inputs - outputs)**2, dim=1)
+
+    #print(losses.size())
+
+    return losses
+
+# returns tpr value for specific threshold
+# signal_losses is a tensor of individual losses for a given signal dataset
+def get_tpr(threshold, signal_losses):
+    tpr = torch.sum(signal_losses > threshold).float() / len(signal_losses)
+    return tpr
+
+# retruns threshold given an fpr
+def get_threshold(fpr, background_losses):
+    background_losses = background_losses.sort()[0] # Use PyTorch's sort function and pick values
+    num_false_pos = int(len(background_losses) * fpr)
+    threshold = background_losses[-num_false_pos]
+    return threshold
 
 #exponential linespace because we have a large threshold space to cover
 def powspace(start, stop, power, num):
@@ -203,152 +282,37 @@ def powspace(start, stop, power, num):
     stop = np.power(stop, 1/float(power))
     return np.power( np.linspace(start, stop, num=num), power)
 
-def get_parameters_to_prune(model):
-    parameters_to_prune = []
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Conv2d) or isinstance(module, torch.nn.Linear):
-            parameters_to_prune.append((module, 'weight'))
-    return tuple(parameters_to_prune)[1:]
-
-def sparsity_print(model):
-    prune.global_unstructured(get_parameters_to_prune(model),pruning_method=prune.L1Unstructured,amount=0)
-    zero = total = 0
-    for module, _ in get_parameters_to_prune(model):
-        zero += float(torch.sum(module.weight == 0))
-        total += float(module.weight.nelement())
-    print('Number of Zero Weights:', zero)
-    print('Total Number of Weights:', total)
-    print('Sparsity', zero/total)
-    return zero, total
-
-def Prune(model, train_loader, val_loader, pruning_iters = 30, num_epochs = 60, amount = .2, delay_pruning_epochs = 0):
-    zeros = [] #keeps track of zeros at each iteration
-    tprs = [] #keeps track of tpr at each pruning iteration
-    train_losses = [] #keeps track of training loss at each pruning iteration
-    val_losses = [] #keeps track of validation loss at each pruning iteration
-    background_losses_all = [] #keeps track of background losses at each pruning iteration
-    signal_losses_all = [] #keeps track of signal losses at each pruning iteration
-    fpr_target = 0.00001
+def get_losses(model, dataloader):
+    model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    results = []
+    with torch.no_grad():
+        for data, data_scaled in dataloader: 
+            data, data_scaled = data.float().to(device), data_scaled.float().to(device)
+            outputs = model(data)
+            losses = batch_custom_MSE(outputs, data_scaled)
+            results.append(losses)
+    return torch.cat(results, 0)
 
-    #Create rewind point for model
-    model_rewind = copy.deepcopy(model).to(device)
+def print_tprs(background_losses, list_of_signal_losses, signal_labels, fpr = 1e-5):
+    threshold = get_threshold(fpr, background_losses)
+    for idx, signal_losses in enumerate(list_of_signal_losses):
+      tpr = get_tpr(threshold, signal_losses)
+      #print(signal_labels[idx], tpr)
+      print(f"{signal_labels[idx]} {tpr.item():.4f}")
 
-    #Pretrain model before pruning
-    train_loss, val_loss = train(model, train_loader, num_epochs = num_epochs, get_losses = True, val_loader = val_loader)
+def plot_auc(background_losses, list_of_signal_losses, signal_labels, num_fprs=1000, plot=False):
+      signal_tprs = torch.zeros(len(list_of_signal_losses), num_fprs)
+      fprs = powspace(1e-6, 1, 5, num_fprs) 
+      for fpr_idx, fpr in enumerate(fprs):
+          threshold = get_threshold(fpr, background_losses)
+          for signal_idx, signal_losses in enumerate(list_of_signal_losses):
+            tpr = get_tpr(threshold, signal_losses)
+            signal_tprs[signal_idx, fpr_idx] = tpr
 
-    #Lottery Ticket Rewinding: Prune, Rewind, Train
-    for i in range(pruning_iters):
-        print('Pruning Iteration:', i+1)
-        #Prune
-        prune.global_unstructured(get_parameters_to_prune(model),pruning_method=prune.L1Unstructured,amount=amount)
-        #Rewind Weights
-        for idx, (module, _) in enumerate(get_parameters_to_prune(model)):
-            with torch.no_grad():
-                module_rewind = get_parameters_to_prune(model_rewind)[idx][0]
-                module.weight_orig.copy_(module_rewind.weight)
-        #Train Weights
-        train_loss, val_loss = train(model, train_loader, num_epochs = num_epochs, get_losses = True, val_loader = val_loader)
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-
-        # Compute background and signal losses after training
-        background_losses, signal_losses = compute_losses(model, bkg_test_loader, list_of_signal_dataloaders)
-        background_losses_all.append(background_losses)
-        signal_losses_all.append(signal_losses)
-
-        #Log Results
-        zero, total = sparsity_print(model)
-        zeros.append(zero)
-
-        # Compute TPR for specific FPR
-        tpr_iter = [] #keeps track of tpr for each signal dataset in this iteration
-        for j in range(4):
-            tpr = get_tpr(fpr_target, background_losses, signal_losses[j])
-            tpr_iter.append(tpr)
-            print(f'Pruning Iteration {i+1}, Signal Dataset {j+1}: TPR at FPR {fpr_target}: {tpr}')
-        tprs.append(tpr_iter)
-
-    return train_losses, val_losses, zeros, total, tprs, background_losses_all, signal_losses_all
-
-def plot_and_return_losses_vs_sparsity(zeros, total, train_losses, val_losses, plot=False):
-    # Convert zeros to sparsity (divide by total)
-    sparsity = [zero / total for zero in zeros]
-
-    # Create lists to return
-    train_losses_last = [losses[-1] for losses in train_losses]
-    val_losses_last = [losses[-1] for losses in val_losses]
-
-    if plot:
-        plt.figure(figsize=(10, 5))
-        plt.title("Training and Validation Loss vs. Sparsity")
-        plt.plot(sparsity, train_losses_last, label="train")
-        plt.plot(sparsity, val_losses_last, label="val")
-        plt.xlabel("Sparsity")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.show()
-
-    return sparsity, train_losses_last, val_losses_last
-
-def plot_and_return_tprs(tprs, plot=False):
-    # Number of signal datasets
-    num_datasets = len(tprs[0])
-
-    # Add correct signal labels
-    signal_labels = ['Ato4l','hChToTauNu', 'hToTauTau', 'leptoquark']
-
-    tprs_all_datasets = []
-    # For each signal dataset
-    for i in range(num_datasets):
-        # Extract the TPR for each pruning iteration for the current signal dataset
-        tprs_dataset = [tprs_iter[i] for tprs_iter in tprs]
-        tprs_all_datasets.append(tprs_dataset)
-        if plot:
-            plt.plot(tprs_dataset, label=signal_labels[i]) # Use the actual signal names from the list
-
-    if plot:
-        # Set the labels for the x and y axes
-        plt.semilogy()
-        plt.xlabel('Pruning Iteration')
-        plt.ylabel('TPR')
-
-        # Set the title for the plot
-        plt.title('TPR at each Pruning Iteration')
-
-        # Add a legend
-        plt.legend()
-
-        # Show the plot
-        plt.show()
-        
-    return tprs_all_datasets
-
-def calc_and_plot_losses(background_losses, signal_losses, signal_labels, num_thresholds=1000, plot=False):
-  fpr_losses_all = []
-  tpr_losses_all = []
-  for pruning_iter in range(len(background_losses)): #number of pruning iters
-      fpr_losses = []
-      tpr_losses = np.zeros((4, num_thresholds))
-
-      # For each possible threshold, calculate the tpr/fpr loss
-      for idx, threshold in enumerate(powspace(0,500000, 10, num_thresholds)): #fix later to smaller increments
-          # Calculate fpr from the background data
-          num_false_pos = np.sum(background_losses[pruning_iter] > threshold)
-          fpr_loss = num_false_pos / len(background_losses[pruning_iter]) # fpr = fp/(fp+tn)
-          fpr_losses.append(fpr_loss)
-
-          # Calculate tpr for each signal dataset
-          for i in range(4):
-              losses = signal_losses[pruning_iter][i]
-              num_true_pos = np.sum(losses > threshold) # counts number of individual losses above threshold
-              tpr_loss = num_true_pos / len(losses)
-              tpr_losses[i,idx] = tpr_loss
-
-      if plot:
-          # Plot curves for each signal dataset
-          for i in range(4):
-              plt.plot(fpr_losses, tpr_losses[i], label = signal_labels[i] + ', auc: {}'.format(( round(auc(fpr_losses,tpr_losses[i]),2) )))
+      # Plot curves for each signal dataset
+      for signal_idx in range(len(list_of_signal_losses)):
+          plt.plot(fprs, signal_tprs[signal_idx].numpy(), label = signal_labels[signal_idx] + ', auc: {}'.format(( round(auc(fprs, signal_tprs[signal_idx].numpy()), 2) )))
           plt.semilogx()
           plt.semilogy()
           plt.ylabel("True Positive Rate")
@@ -359,30 +323,4 @@ def calc_and_plot_losses(background_losses, signal_losses, signal_labels, num_th
           plt.plot(np.linspace(0, 1),np.linspace(0, 1), '--', color='0.75')
           plt.axvline(0.00001, color='red', linestyle='dashed', linewidth=1) # threshold value for measuring anomaly detection efficiency
           plt.title("ROC AE")
-          plt.show()
-
-      fpr_losses_all.append(fpr_losses)
-      tpr_losses_all.append(tpr_losses)
-
-  return fpr_losses_all, tpr_losses_all
-
-def plot_histogram(background_losses, signal_losses, signal_labels, bin_size=100, plot=False):
-    # Preparing data and labels for the plot
-    losses = [background_losses] + list(signal_losses)
-    labels = ['background'] + [signal_labels[i] for i in range(4)]
-    
-    if plot:
-        plt.figure(figsize=(10,8))
-        for i in range(5):
-            plt.hist(losses[i], bins=bin_size, density=True, histtype='step', fill=False, linewidth=1.5, label = labels[i])
-
-        plt.yscale('log')
-        #plt.xscale('log')
-        plt.xlabel("Autoencoder Loss")
-        plt.ylabel("Probability (a.u.)")
-        plt.title('MSE loss')
-        plt.legend()  # Show legend to distinguish different histograms
-        plt.show()
-
-    return losses, labels
-
+      plt.show()
