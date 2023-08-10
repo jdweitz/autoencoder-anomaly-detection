@@ -290,7 +290,7 @@ def get_losses(model, dataloader):
         for data, data_scaled in dataloader: 
             data, data_scaled = data.float().to(device), data_scaled.float().to(device)
             outputs = model(data)
-            losses = batch_custom_MSE(outputs, data_scaled)
+            losses = batch_custom_MSE(data_scaled, outputs) # SWITCHES
             results.append(losses)
     return torch.cat(results, 0)
 
