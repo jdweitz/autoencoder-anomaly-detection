@@ -1,0 +1,177 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "machine_shape": "hm",
+      "gpuType": "T4"
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    },
+    "accelerator": "GPU"
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "source": [
+        "from preprocess import *\n",
+        "from VAE_methods import *"
+      ],
+      "metadata": {
+        "id": "fJlwYoq1iS-d"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# path = enter/path/to/file"
+      ],
+      "metadata": {
+        "id": "KlZ2cbOThuko"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "input_file = path + \"background_for_training.h5\"\n",
+        "input_bsm = [\n",
+        "    path + \"leptoquark_LOWMASS_lepFilter_13TeV_filtered.h5\",\n",
+        "    path + \"Ato4l_lepFilter_13TeV_filtered.h5\",\n",
+        "    path + \"hChToTauNu_13TeV_PU20_filtered.h5\",\n",
+        "    path + \"hToTauTau_13TeV_PU20_filtered.h5\"\n",
+        "]\n",
+        "output_file = path + \"all_background_processed.h5\"\n",
+        "output_bsm = [\n",
+        "    path + 'all_leptoquark_processed.h5',\n",
+        "    path + 'all_Ato4l_processed.h5',\n",
+        "    path + 'all_hChToTauNu_processed.h5',\n",
+        "    path + 'all_hToTauTau_processed.h5'\n",
+        "]"
+      ],
+      "metadata": {
+        "id": "3m_YijIh47Qj"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# PREPROCESS BACKGROUND DATA\n",
+        "pt_scaler = prepare_bkg_data(input_file, output_file)"
+      ],
+      "metadata": {
+        "id": "1AtwWKq8hc4K"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# PREPROCESS SIGNAL DATA\n",
+        "prepare_bsm_data(input_bsm, output_bsm, pt_scaler)"
+      ],
+      "metadata": {
+        "id": "fnFGoP8JWNXb"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# LOAD DATA\n",
+        "BATCH_SIZE = # 1024\n",
+        "list_of_signal_dataloaders, bkg_trainloader, bkg_valloader, bkg_testloader, signal_labels = get_dataloaders(path, BATCH_SIZE)"
+      ],
+      "metadata": {
+        "id": "pbRTemnqrP_k"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# RUN TRAINING SCRIPT\n",
+        "device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+        "model = Autoencoder().to(device)\n",
+        "train_losses, val_losses = train(model, bkg_trainloader, num_epochs = 100, get_losses = True, val_loader = bkg_valloader, beta = 0.8)"
+      ],
+      "metadata": {
+        "id": "GZlCGMo3T3a5"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# GET BACKGROUND LOSSES\n",
+        "background_losses = get_losses(model, bkg_testloader)"
+      ],
+      "metadata": {
+        "id": "CNJNeL2ev9eo"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# GET SIGNAL LOSSES\n",
+        "list_of_signal_losses = []\n",
+        "for signal_dataloader in list_of_signal_dataloaders:\n",
+        "    signal_losses = get_losses(model, signal_dataloader)\n",
+        "    list_of_signal_losses.append(signal_losses)"
+      ],
+      "metadata": {
+        "id": "dIqAHUQ3w2YW"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# PRINT TPR VALUES\n",
+        "print_tprs(background_losses, list_of_signal_losses, signal_labels)"
+      ],
+      "metadata": {
+        "id": "brGiLEJntIZj"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# PLOT AUCs OF SIGNALS\n",
+        "plot_auc(background_losses, list_of_signal_losses, signal_labels)"
+      ],
+      "metadata": {
+        "id": "f-F_fjALuYOU"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [],
+      "metadata": {
+        "id": "H-fa9IaLd9fu"
+      }
+    }
+  ]
+}
